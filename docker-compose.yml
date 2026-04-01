@@ -1,0 +1,69 @@
+# MCEI docker-compose — production deployment
+# Starts: API server + background scheduler as separate containers,
+# sharing a single data volume for SQLite and Qdrant persistence.
+#
+# Required: copy .env.example to .env and fill in all CRITICAL / DEGRADED keys.
+#
+# Usage:
+#   docker compose up -d          # start everything
+#   docker compose logs -f api    # tail API logs
+#   docker compose logs -f sched  # tail scheduler logs
+#   docker compose down           # stop (data persists in mcei_data volume)
+
+services:
+
+  # ── FastAPI REST API ──────────────────────────────────────────────────────
+  api:
+    build: .
+    image: mcei:latest
+    container_name: mcei_api
+    restart: unless-stopped
+    environment:
+      SERVICE: api
+    env_file: .env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - mcei_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Background job scheduler ──────────────────────────────────────────────
+  scheduler:
+    image: mcei:latest
+    container_name: mcei_scheduler
+    restart: unless-stopped
+    environment:
+      SERVICE: scheduler
+    env_file: .env
+    volumes:
+      - mcei_data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ── Streamlit dashboard (optional; comment out if not needed) ─────────────
+  dashboard:
+    image: mcei:latest
+    container_name: mcei_dashboard
+    restart: unless-stopped
+    environment:
+      SERVICE: dashboard
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - mcei_data:/data
+    depends_on:
+      - api
+    profiles:
+      - dashboard   # start with: docker compose --profile dashboard up -d
+
+volumes:
+  mcei_data:
+    driver: local

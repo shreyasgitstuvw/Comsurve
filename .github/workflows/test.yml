@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          # Dummy values so config validation doesn't abort at import time.
+          # Tests use in-memory SQLite and mock all external APIs.
+          GEMINI_API_KEY: "ci-dummy-key"
+          MCEI_API_KEY: ""
+          DB_PATH: ":memory:"
+          QDRANT_PATH: "/tmp/qdrant_ci"
+          LOG_LEVEL: "WARNING"
+        run: |
+          python -m pytest tests/ \
+            --tb=short \
+            -q \
+            --timeout=60
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-output
+          path: |
+            .pytest_cache/
+          retention-days: 7
