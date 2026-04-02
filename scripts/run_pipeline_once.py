@@ -91,16 +91,16 @@ def main():
     else:
         print("\n[3/5] AI Engine — SKIPPED")
 
-    # ── Stage 4: Causality + Prediction ──────────────────────────────────────
+    # ── Stage 4: Causality ────────────────────────────────────────────────────
+    # Note: prediction_engine is already triggered by signal_correlator when new
+    # alerts are created (same-run, no quota duplication). Running it again here
+    # would retry quota-failed alerts immediately and burn the same daily limit.
     if not args.skip_ai:
-        print("\n[4/5] Causality + Prediction ...")
+        print("\n[4/5] Causality ...")
         from ai_engine.causality_engine import run_causality_engine
         _run(results, "causality", run_causality_engine)
-
-        from ai_engine.prediction_engine import run_prediction_engine
-        _run(results, "prediction", run_prediction_engine)
     else:
-        print("\n[4/5] Causality + Prediction — SKIPPED")
+        print("\n[4/5] Causality — SKIPPED")
 
     # ── Stage 5: DB health check ──────────────────────────────────────────────
     print("\n[5/5] DB health check ...")
@@ -143,7 +143,7 @@ def main():
     print("=" * 68)
     for stage, result in results.items():
         status = result.get("status", "ok")
-        icon = "✓" if status not in ("error",) else "✗"
+        icon = "OK" if status not in ("error",) else "XX"
         if stage == "db_health" and status == "ok":
             print(f"  {icon}  {stage:22s}  {result['counts']}")
             print(f"       {'':22s}  pending={result['anomalies_pending']}  "

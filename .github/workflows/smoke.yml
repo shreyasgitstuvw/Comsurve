@@ -1,0 +1,65 @@
+name: Smoke Test
+
+on:
+  schedule:
+    # Daily 07:00 UTC — after Gemini free-tier quota resets (midnight US-PT ≈ 07:00 UTC)
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_ai:
+        description: "Skip Gemini AI stages (avoids burning daily quota)"
+        type: boolean
+        default: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONIOENCODING: "utf-8"
+      DB_PATH: "/tmp/mcei_ci.db"
+      QDRANT_PATH: "/tmp/qdrant_ci"
+      LOG_LEVEL: "WARNING"
+      MCEI_API_KEY: ""
+      # Real API keys injected from secrets — absent keys degrade gracefully
+      GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+      FRED_API_KEY:        ${{ secrets.FRED_API_KEY }}
+      EIA_API_KEY:         ${{ secrets.EIA_API_KEY }}
+      NEWSDATA_API_KEY:    ${{ secrets.NEWSDATA_API_KEY }}
+      AISSTREAM_API_KEY:   ${{ secrets.AISSTREAM_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Apply DB migrations
+        run: python -m alembic upgrade head
+
+      - name: Run smoke test (scheduled — skip AI)
+        if: github.event_name == 'schedule'
+        run: python scripts/run_pipeline_once.py --skip-ai
+
+      - name: Run smoke test (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.skip_ai }}" = "true" ]; then
+            FLAGS="--skip-ai"
+          fi
+          python scripts/run_pipeline_once.py $FLAGS
+
+      - name: Upload DB on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcei-ci-db
+          path: /tmp/mcei_ci.db
+          retention-days: 3

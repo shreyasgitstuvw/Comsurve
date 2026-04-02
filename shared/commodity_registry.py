@@ -17,9 +17,13 @@ FRED_SERIES: Final[dict[str, str]] = {
 }
 
 # ── EIA series IDs ────────────────────────────────────────────────────────────
+# lng_exports uses the /v2/natural-gas/move/expc/data/ route (seriesid route gives 404)
+# ng_storage uses the /v2/seriesid/ route (still valid)
+EIA_EXPC_SERIES: Final[dict[str, str]] = {
+    "lng_exports": "N9133US2",           # Liquefied US Natural Gas Exports (MMcf, monthly)
+}
 EIA_SERIES: Final[dict[str, str]] = {
-    "lng_exports": "NG.N9133US2.W",      # US LNG exports (Bcf/week)
-    "ng_storage": "NG.NW2_EPG0_SWO_R48_BCF.W",  # Working gas in storage
+    "ng_storage": "NG.NW2_EPG0_SWO_R48_BCF.W",  # Working gas in storage (Bcf/week)
 }
 
 # ── yfinance tickers ──────────────────────────────────────────────────────────
