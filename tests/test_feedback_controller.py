@@ -261,11 +261,11 @@ def _fake_session_factory(db_session):
 
 class TestLearningStoreGetLearningContext:
 
-    def _run(self, db_session):
+    def _run(self, db_session, commodity="lng", anomaly_type="price_spike"):
         fake_session = _fake_session_factory(db_session)
         with patch("ai_engine.learning_store.get_session", side_effect=fake_session):
             from ai_engine.learning_store import get_learning_context
-            return get_learning_context("lng", "price_spike")
+            return get_learning_context(commodity, anomaly_type)
 
     def test_returns_empty_string_with_no_data(self, db_session):
         result = self._run(db_session)
@@ -274,3 +274,96 @@ class TestLearningStoreGetLearningContext:
     def test_returns_string_type(self, db_session):
         result = self._run(db_session)
         assert isinstance(result, str)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# learning_store._fetch_evaluations — cross-commodity pool
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLearningStoreCrossCommodity:
+    """
+    Verify that _fetch_evaluations pulls from other commodities (same anomaly_type)
+    as a soft prior, prepended before same-commodity rows.
+    """
+
+    def _run_fetch(self, db_session, commodity="lng", anomaly_type="price_spike"):
+        fake_session = _fake_session_factory(db_session)
+        with patch("ai_engine.learning_store.get_session", side_effect=fake_session):
+            from ai_engine.learning_store import _fetch_evaluations
+            return _fetch_evaluations(commodity, anomaly_type)
+
+    def test_no_data_returns_empty(self, db_session):
+        evals, insights = self._run_fetch(db_session)
+        assert evals == []
+        assert insights == []
+
+    def test_cross_commodity_rows_prepended_to_same_commodity(self, db_session):
+        """
+        _fetch_eval_rows is patched to return distinct lists per commodity.
+        Cross-commodity rows must appear before same-commodity rows in the output.
+        """
+        import json as _json
+        from unittest.mock import patch as _patch
+
+        same_row = (
+            _json.dumps({"direction_correct": True, "magnitude_error": 1.0}),
+            _json.dumps([]),
+            "same-commodity insight",
+            "same adjustment",
+        )
+        cross_row = (
+            _json.dumps({"direction_correct": False, "magnitude_error": 5.0}),
+            _json.dumps([]),
+            "cross-commodity insight",
+            "cross adjustment",
+        )
+
+        def fake_fetch_rows(commodity, anomaly_type, limit):
+            if commodity == "lng":
+                return [same_row]
+            return [cross_row]
+
+        with _patch("ai_engine.learning_store._fetch_eval_rows", side_effect=fake_fetch_rows):
+            from ai_engine.learning_store import _fetch_evaluations
+            evals, insights = _fetch_evaluations("lng", "price_spike")
+
+        # cross rows are prepended; same row is last (most influential in damping)
+        assert len(evals) >= 2
+        # Last eval should be same-commodity (direction_correct=True)
+        assert evals[-1]["direction_correct"] is True
+        # Earlier evals should include cross-commodity (direction_correct=False)
+        assert any(e["direction_correct"] is False for e in evals[:-1])
+
+    def test_insights_only_from_same_commodity(self, db_session):
+        """
+        Cross-commodity rows should NOT surface in the insights list
+        (only same-commodity insights appear in the prompt).
+        """
+        import json as _json
+        from unittest.mock import patch as _patch
+
+        same_row = (
+            _json.dumps({"direction_correct": True, "magnitude_error": 1.0}),
+            _json.dumps([]),
+            "same-only insight",
+            "same adjustment",
+        )
+        cross_row = (
+            _json.dumps({"direction_correct": False, "magnitude_error": 5.0}),
+            _json.dumps([]),
+            "cross insight should not appear",
+            "cross adjustment",
+        )
+
+        def fake_fetch_rows(commodity, anomaly_type, limit):
+            if commodity == "lng":
+                return [same_row]
+            return [cross_row]
+
+        with _patch("ai_engine.learning_store._fetch_eval_rows", side_effect=fake_fetch_rows):
+            from ai_engine.learning_store import _fetch_evaluations
+            _, insights = _fetch_evaluations("lng", "price_spike")
+
+        insight_texts = [i for i, _ in insights]
+        assert "same-only insight" in insight_texts
+        assert all("cross insight" not in t for t in insight_texts)

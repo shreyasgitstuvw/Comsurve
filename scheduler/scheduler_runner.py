@@ -14,9 +14,11 @@ Processor is deliberately offset +30 minutes from the top of the hour
 so it runs after AIS data has been ingested (AIS fires on the hour).
 """
 
+import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -178,6 +180,17 @@ def build_scheduler() -> BackgroundScheduler:
         name="Qdrant Vector DB Backup (7-day retention)",
     )
 
+    # ── SQLite backup: daily at 03:30 ─────────────────────────────────────────
+    # Runs between ai_engine (03:00) and causality (04:00).
+    # Uses VACUUM INTO for an atomic, consistent snapshot of mcei.db.
+    from scheduler.jobs import job_sqlite_backup
+    scheduler.add_job(
+        job_sqlite_backup,
+        trigger=CronTrigger(hour=3, minute=30),
+        id="sqlite_backup",
+        name="SQLite DB Backup (7-day retention)",
+    )
+
     return scheduler
 
 
@@ -213,8 +226,17 @@ def main():
     print_job_table(scheduler)
     print("Scheduler running. Press Ctrl+C to stop.\n")
 
+    # Heartbeat file updated every loop tick.
+    # Docker healthcheck reads this file to verify the scheduler process is alive.
+    heartbeat_path = Path(os.getenv("SCHEDULER_HEARTBEAT_PATH", "/data/scheduler_heartbeat"))
+
     try:
         while True:
+            try:
+                heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+                heartbeat_path.write_text(str(time.time()))
+            except OSError:
+                pass  # non-fatal; Docker healthcheck will catch a stale file
             time.sleep(30)
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown(wait=False)

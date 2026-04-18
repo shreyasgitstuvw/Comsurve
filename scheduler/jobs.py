@@ -119,3 +119,37 @@ def job_qdrant_backup():
     pruned = prune_old_backups(backup_dir, retention_days=7)
     return {"archives_created": len(created), "archives_pruned": pruned,
             "status": "ok" if created else "no_data"}
+
+
+def job_sqlite_backup():
+    """
+    Atomic SQLite backup using VACUUM INTO.
+    Creates a timestamped copy of mcei.db; prunes copies older than 7 days.
+    VACUUM INTO is guaranteed consistent — no WAL flush or lock needed.
+    """
+    import datetime
+    import os
+    from pathlib import Path
+    from shared.config import settings
+    from shared.db import get_session
+    from sqlalchemy import text
+
+    db_path = Path(settings.db_path)
+    backup_dir = Path(db_path.parent) / "sqlite_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    dest = backup_dir / f"mcei_{ts}.db"
+
+    with get_session() as session:
+        session.execute(text(f"VACUUM INTO '{dest}'"))  # noqa: S608 — dest is internal path
+
+    # Prune backups older than 7 days
+    cutoff = datetime.datetime.utcnow().timestamp() - 7 * 86400
+    pruned = 0
+    for f in backup_dir.glob("mcei_*.db"):
+        if f.stat().st_mtime < cutoff:
+            f.unlink()
+            pruned += 1
+
+    return {"backup_path": str(dest), "pruned": pruned, "status": "ok"}

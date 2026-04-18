@@ -46,6 +46,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      # Pass if heartbeat file was written within the last 90 seconds
+      # (scheduler loop writes it every 30s; two missed ticks = fail).
+      test: ["CMD", "python", "-c",
+             "import time,os; age=time.time()-os.path.getmtime('/data/scheduler_heartbeat'); exit(0 if age<90 else 1)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
 
   # ── Streamlit dashboard (optional; comment out if not needed) ─────────────
   dashboard:

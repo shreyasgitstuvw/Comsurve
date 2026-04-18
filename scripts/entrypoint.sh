@@ -28,10 +28,12 @@ case "${SERVICE}" in
         alembic upgrade head
 
         echo "[mcei] Starting API server (uvicorn) on ${API_HOST:-0.0.0.0}:${API_PORT:-8000}"
+        # Default 2 workers so one slow request can't block the /health probe.
+        # Set UVICORN_WORKERS in .env for higher-traffic deployments.
         exec uvicorn api.main:app \
             --host "${API_HOST:-0.0.0.0}" \
             --port "${API_PORT:-8000}" \
-            --workers 1 \
+            --workers "${UVICORN_WORKERS:-2}" \
             --log-level warning \
             --no-access-log
         ;;

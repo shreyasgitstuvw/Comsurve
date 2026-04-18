@@ -77,7 +77,7 @@ class TestHealthEndpoint:
     def test_health_response_has_required_fields(self, client):
         resp = client.get("/health")
         data = resp.json()
-        assert data["status"] == "ok"
+        assert data["status"] in ("ok", "warning", "degraded")
         assert "table_counts" in data
         assert "uptime_seconds" in data
         assert "version" in data

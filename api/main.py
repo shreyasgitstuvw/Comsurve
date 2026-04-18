@@ -18,11 +18,19 @@ from api.dependencies import require_api_key
 from api.routers import anomalies, evaluations, health, metrics, predictions, prices, reports, signals
 from shared.config import settings, validate_secrets
 from shared.db import init_db
-from shared.logger import configure_logging
+from shared.logger import configure_logging, get_logger
 
 configure_logging()
 validate_secrets(abort_on_critical=True)
 init_db()
+
+_startup_logger = get_logger("mcei.startup")
+if not settings.mcei_api_key:
+    _startup_logger.warning(
+        "auth_disabled",
+        message="MCEI_API_KEY is not set — all API endpoints are PUBLIC. "
+                "Set MCEI_API_KEY in .env before exposing this service.",
+    )
 
 # ── Rate limiter (120 req/min per IP by default) ──────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])

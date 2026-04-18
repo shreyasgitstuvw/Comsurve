@@ -17,6 +17,8 @@ _START_DT   = datetime.now(timezone.utc)
 
 VERSION = "0.1.0"
 
+# Explicit allowlist — prevents any f-string table injection even if this list
+# is ever constructed dynamically. Only names in this set reach SQL.
 TABLES = [
     "raw_ingestion",
     "processed_features",
@@ -27,15 +29,60 @@ TABLES = [
     "prediction_evaluations",
     "learning_updates",
 ]
+_ALLOWED_TABLES: frozenset[str] = frozenset(TABLES)
+
+
+def _count_table(db: Session, table: str) -> int:
+    """Count rows in a known-safe table. Raises if name is not in the allowlist."""
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(f"Unknown table: {table!r}")
+    # Table names cannot be parameterised in SQLite; allowlist check above is the guard.
+    row = db.execute(text(f"SELECT COUNT(*) FROM {table}")).fetchone()  # noqa: S608
+    return row[0] if row else 0
+
+
+def _qdrant_ok() -> bool:
+    """Return True if Qdrant local store is reachable and has at least one collection."""
+    try:
+        from ai_engine.qdrant_manager import QdrantManager
+        qm = QdrantManager()
+        collections = qm._client.get_collections().collections
+        qm.close()
+        return len(collections) > 0
+    except Exception:
+        return False
+
+
+def _ai_engine_stale(db: Session, staleness_hours: int = 30) -> bool:
+    """
+    Return True if the ai_engine job has not succeeded in the last staleness_hours.
+    Indicates the embedding + correlation pipeline is behind.
+    """
+    try:
+        row = db.execute(
+            text("""
+                SELECT finished_at FROM job_runs
+                WHERE job_name = 'ai_engine' AND status = 'ok'
+                ORDER BY finished_at DESC LIMIT 1
+            """)
+        ).fetchone()
+        if not row or not row[0]:
+            return True
+        last_run = datetime.fromisoformat(str(row[0]))
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600
+        return age_hours > staleness_hours
+    except Exception:
+        return True
 
 
 @router.get("")
 def health(db: Session = Depends(get_db)):
-    # Table row counts
+    # Table row counts (allowlist-guarded)
     counts = {}
     for table in TABLES:
-        row = db.execute(text(f"SELECT COUNT(*) FROM {table}")).fetchone()
-        counts[table] = row[0] if row else 0
+        counts[table] = _count_table(db, table)
 
     # Recent job runs
     try:
@@ -69,14 +116,25 @@ def health(db: Session = Depends(get_db)):
                 last_success[name] = j["finished_at"]
 
     uptime_seconds = int(time.monotonic() - _START_TIME)
+    qdrant_healthy = _qdrant_ok()
+    ai_stale = _ai_engine_stale(db)
+
+    # Overall status degrades if Qdrant is unreachable or AI pipeline is stale
+    overall = "ok"
+    if not qdrant_healthy:
+        overall = "degraded"
+    elif ai_stale:
+        overall = "warning"
 
     return {
-        "status": "ok",
+        "status": overall,
         "version": VERSION,
         "started_at": _START_DT.isoformat(),
         "uptime_seconds": uptime_seconds,
         "db_path": settings.db_path,
         "auth_enabled": bool(settings.mcei_api_key),
+        "qdrant_healthy": qdrant_healthy,
+        "ai_engine_stale": ai_stale,
         "table_counts": counts,
         "last_job_success": last_success,
         "recent_jobs": recent_jobs[:20],

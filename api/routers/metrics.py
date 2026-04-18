@@ -26,8 +26,9 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_db
-from api.routers.health import TABLES, VERSION, _START_TIME
+
+from api.dependencies import get_db, require_api_key
+from api.routers.health import TABLES, VERSION, _START_TIME, _count_table
 
 router = APIRouter(prefix="/metrics", tags=["observability"])
 
@@ -44,7 +45,8 @@ def _prom_line(name: str, labels: dict, value: float | int, comment: str = "") -
     return f"{name}{suffix} {value}"
 
 
-@router.get("", response_class=PlainTextResponse, include_in_schema=False)
+@router.get("", response_class=PlainTextResponse, include_in_schema=False,
+            dependencies=[Depends(require_api_key)])
 def prometheus_metrics(db: Session = Depends(get_db)) -> str:
     """Return all MCEI metrics in Prometheus text exposition format."""
     lines: list[str] = []
@@ -70,8 +72,7 @@ def prometheus_metrics(db: Session = Depends(get_db)) -> str:
         "# TYPE mcei_table_rows gauge",
     ]
     for table in TABLES:
-        row = db.execute(text(f"SELECT COUNT(*) FROM {table}")).fetchone()
-        count = row[0] if row else 0
+        count = _count_table(db, table)
         lines.append(_prom_line("mcei_table_rows", {"table": table}, count))
 
     # ── mcei_anomalies_total ──────────────────────────────────────────────────

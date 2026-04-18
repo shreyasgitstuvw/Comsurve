@@ -396,3 +396,108 @@ class TestSummaryDict:
         )
         assert "predictions" in result
         assert result["predictions"]["predictions_generated"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — Cross-commodity analog search
+# ---------------------------------------------------------------------------
+
+class TestCrossCommoditySearch:
+    """
+    Verify that the correlator queries other commodity collections and appends
+    cross-commodity analog IDs when they exceed the CROSS_COMMODITY_SIMILARITY
+    threshold.
+    """
+
+    def test_cross_commodity_results_appended_to_correlated_ids(self, db_session):
+        """
+        Same-commodity returns 1 match (id=10, score=0.80).
+        Cross-commodity returns 1 match from copper (id=99, score=0.76).
+        Both IDs should appear in the stored SignalAlert.
+        """
+        from shared.models import SignalAlert
+
+        _insert_processed_anomaly(db_session, commodity="lng")
+
+        same_match = SimpleNamespace(id=10, score=0.80)
+        cross_match = SimpleNamespace(id=99, score=0.76)
+
+        # search_similar returns same-commodity result for "lng", cross-commodity
+        # result for "copper" / "soybeans", empty for the other.
+        def side_effect(commodity, vector, top_k, exclude_id, min_score):
+            if commodity == "lng":
+                return [same_match]
+            if commodity == "copper":
+                return [cross_match]
+            return []
+
+        mock_qdrant = MagicMock()
+        mock_qdrant.search_similar.side_effect = side_effect
+
+        _run_correlator(db_session, mock_qdrant_instance=mock_qdrant)
+
+        alert = db_session.query(SignalAlert).first()
+        assert alert is not None
+        stored_ids = json.loads(alert.correlated_anomaly_ids)
+        assert 10 in stored_ids, "Same-commodity match should be in correlated_ids"
+        assert 99 in stored_ids, "Cross-commodity match should be appended"
+
+    def test_cross_commodity_below_threshold_not_included(self, db_session):
+        """
+        Cross-commodity result with score=0.60 (below CROSS_COMMODITY_SIMILARITY=0.75)
+        should not appear — the Qdrant mock returns empty for other commodities when
+        threshold is respected.
+        """
+        from shared.models import SignalAlert
+
+        _insert_processed_anomaly(db_session, commodity="lng")
+
+        same_match = SimpleNamespace(id=10, score=0.80)
+
+        # Cross-commodity search returns empty (threshold not met)
+        def side_effect(commodity, vector, top_k, exclude_id, min_score):
+            if commodity == "lng":
+                return [same_match]
+            return []  # below-threshold analogs already filtered by Qdrant mock
+
+        mock_qdrant = MagicMock()
+        mock_qdrant.search_similar.side_effect = side_effect
+
+        _run_correlator(db_session, mock_qdrant_instance=mock_qdrant)
+
+        alert = db_session.query(SignalAlert).first()
+        stored_ids = json.loads(alert.correlated_anomaly_ids)
+        assert stored_ids == [10]
+
+    def test_cross_commodity_search_calls_other_commodities(self, db_session):
+        """Verify that search_similar is called for each non-self commodity."""
+        _insert_processed_anomaly(db_session, commodity="lng")
+
+        mock_qdrant = _make_mock_qdrant([])
+        _run_correlator(db_session, mock_qdrant_instance=mock_qdrant)
+
+        called_commodities = {
+            call.kwargs.get("commodity") or call.args[0]
+            for call in mock_qdrant.search_similar.call_args_list
+        }
+        # Should have searched lng (same) + copper + soybeans (cross)
+        assert "lng" in called_commodities
+        assert "copper" in called_commodities
+        assert "soybeans" in called_commodities
+
+    def test_no_duplicate_ids_when_cross_commodity_overlaps(self, db_session):
+        """If same ID appears in same + cross commodity results, it should not be duplicated."""
+        from shared.models import SignalAlert
+
+        _insert_processed_anomaly(db_session, commodity="lng")
+
+        duplicate_match = SimpleNamespace(id=42, score=0.85)
+
+        mock_qdrant = MagicMock()
+        mock_qdrant.search_similar.return_value = [duplicate_match]
+
+        _run_correlator(db_session, mock_qdrant_instance=mock_qdrant)
+
+        alert = db_session.query(SignalAlert).first()
+        stored_ids = json.loads(alert.correlated_anomaly_ids)
+        assert stored_ids.count(42) == 1, "Duplicate IDs must not appear"
