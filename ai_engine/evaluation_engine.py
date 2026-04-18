@@ -77,8 +77,11 @@ def _compute_overall_score(accuracy: dict) -> float:
     """
     Composite 0.0-1.0 score:
       direction:   0.4 if correct, 0.2 if null, 0.0 if false
-      magnitude:   max(0, 0.4 - magnitude_error * 0.04)
-      calibration: 0.2 if well_calibrated, 0.1 if underconfident, 0.0 if overconfident
+      magnitude:   max(0, 0.3 - magnitude_error * 0.03)  [10pp error → 0]
+      calibration: 0.3 if well_calibrated, 0.15 if underconfident, 0.0 if overconfident
+
+    Calibration raised to 0.3 (was 0.2) because a well-calibrated but directionally
+    uncertain prediction is more trustworthy than an overconfident correct guess.
     """
     direction_correct = accuracy.get("direction_correct")
     if direction_correct is True:
@@ -89,13 +92,13 @@ def _compute_overall_score(accuracy: dict) -> float:
         direction_score = 0.0
 
     mag_error = float(accuracy.get("magnitude_error") or 0.0)
-    magnitude_score = max(0.0, 0.4 - mag_error * 0.04)
+    magnitude_score = max(0.0, 0.3 - mag_error * 0.03)
 
     calibration = accuracy.get("confidence_validity", "overconfident")
     if calibration == "well_calibrated":
-        calibration_score = 0.2
+        calibration_score = 0.3
     elif calibration == "underconfident":
-        calibration_score = 0.1
+        calibration_score = 0.15
     else:
         calibration_score = 0.0
 

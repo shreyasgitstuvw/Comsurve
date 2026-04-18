@@ -692,15 +692,21 @@ class BacktestPromptBuilder:
 
         ls = learning_section if learning_section else "No prior evaluations available for this signal type."
 
+        from ai_engine.prediction_engine import HORIZON_GUIDANCE, _HORIZON_DEFAULT
+        horizon_guidance = HORIZON_GUIDANCE.get(event.anomaly_type, _HORIZON_DEFAULT)
+
         return PREDICTION_PROMPT.format(
             commodity=event.commodity,
             anomaly_type=event.anomaly_type,
             severity=event.severity,
             detected_at=event.as_of_date.isoformat(),
             signal_context=constrained_context,
+            anomaly_trajectory="[Backtest mode: trajectory data not available for historical replay]",
+            market_context="[Backtest mode: 30-day context constrained to as_of_date]",
             analogs_section=analogs,
             learning_section=ls,
             current_price=price_str,
+            horizon_guidance=horizon_guidance,
             event_id=event.event_id,
         )
 

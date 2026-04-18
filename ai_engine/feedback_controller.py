@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-ALPHA = 0.3          # damping coefficient (recent weight)
+ALPHA = 0.5          # damping coefficient (recent weight); 0.5 = equal recency/history
 W1, W2, W3 = 0.4, 0.4, 0.2   # direction, magnitude, volatility weights
 
 # Thresholds that trigger control adjustments
@@ -168,14 +168,23 @@ def compute_error_signal(
     )
 
 
+_DEMAND_PATTERNS = ("demand miss", "demand-side", "demand side", "demand reversal", "demand driver")
+_SENTIMENT_PATTERNS = ("sentiment over", "over-weighted sentiment", "overweight sentiment",
+                       "sentiment overestim", "over-estimate sentiment")
+_INVENTORY_PATTERNS = ("inventory", "stock level", "storage level", "stockpile")
+_SUPPLY_PATTERNS = ("supply miss", "supply-side", "supply constraint", "supply disruption missed")
+_GEOPOLITICAL_PATTERNS = ("geopolit", "political risk", "sanctions missed", "trade policy")
+
+
 def compute_control_adjustments(signal: ErrorSignal) -> ControlAdjustments:
     """
     Apply rule-based control logic to an ErrorSignal.
     Returns ControlAdjustments with non-null fields only where rules fire.
     """
     adj = ControlAdjustments()
+    failure_text = " ".join(signal.failure_modes).lower()
 
-    # P-channel: direction error
+    # P-channel: direction error threshold
     if signal.damped_direction_error > DIRECTION_HIGH_THRESHOLD:
         adj.confidence_threshold = "increase"
     elif signal.damped_direction_error < 0.2 and signal.n_evaluations >= 3:
@@ -185,24 +194,37 @@ def compute_control_adjustments(signal: ErrorSignal) -> ControlAdjustments:
     if signal.damped_magnitude_error > MAGNITUDE_HIGH_THRESHOLD:
         adj.scenario_complexity = "increase"
 
-    # I-channel: sustained failure mode patterns → driver rules
-    failure_text = " ".join(signal.failure_modes).lower()
-    if "demand" in failure_text and "miss" in failure_text:
+    # I-channel: sustained failure patterns → injected driver rules
+    # Broader pattern matching than single keyword pairs to catch more failure modes.
+    if any(p in failure_text for p in _DEMAND_PATTERNS):
         adj.driver_rules.append(
-            "Always include a demand-side scenario explicitly; past predictions missed demand-driven reversals."
+            "Always include an explicit demand-side scenario; past predictions missed demand-driven reversals."
         )
-    if "sentiment" in failure_text and ("overweight" in failure_text or "over-weight" in failure_text):
+    if any(p in failure_text for p in _SENTIMENT_PATTERNS):
         adj.driver_rules.append(
-            "Down-weight sentiment signals; recent evaluations show sentiment was over-estimated as a price driver."
+            "Down-weight sentiment signals; past evaluations show sentiment was over-estimated as a price driver."
         )
-    if "inventory" in failure_text or "stock" in failure_text:
+    if any(p in failure_text for p in _INVENTORY_PATTERNS):
         adj.driver_rules.append(
             "Validate inventory/stock levels as a key driver; inventory effects were repeatedly missed."
         )
+    if any(p in failure_text for p in _SUPPLY_PATTERNS):
+        adj.driver_rules.append(
+            "Include explicit supply-side constraints; past predictions underweighted supply-driven moves."
+        )
+    if any(p in failure_text for p in _GEOPOLITICAL_PATTERNS):
+        adj.driver_rules.append(
+            "Incorporate geopolitical risk explicitly; past evaluations identified political drivers as missed."
+        )
 
-    # D-channel: both direction AND magnitude high → analogy reliance reduction
+    # D-channel: both direction AND magnitude persistently high → reduce analogy reliance.
+    # High combined error means historical analogs are poor predictors for this regime.
     if (signal.damped_direction_error > BOTH_HIGH_THRESHOLD
             and signal.damped_magnitude_error > MAGNITUDE_HIGH_THRESHOLD):
+        adj.analogy_reliance = "decrease"
+
+    # D-channel extension: composite error alone very high → also reduce analogy reliance
+    if signal.e_total > 0.7 and signal.n_evaluations >= 3:
         adj.analogy_reliance = "decrease"
 
     return adj

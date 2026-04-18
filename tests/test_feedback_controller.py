@@ -40,12 +40,20 @@ class TestDampedAggregate:
         result = _damped_aggregate([0.0, 1.0], alpha=0.5)
         assert result == pytest.approx(0.5, abs=1e-9)
 
-    def test_persistent_high_value_outweighs_single_spike(self):
-        # With ALPHA=0.3 (old-heavy), a sustained early high propagates further
-        # than a single high at the end. This validates the damping direction.
+    def test_persistent_high_value_outweighs_single_spike_with_old_heavy_alpha(self):
+        # With alpha=0.3 (old-heavy), sustained early high propagates further
+        # than a single spike at the end. Validates damping direction property.
+        sustained_early = _damped_aggregate([1.0, 1.0, 1.0, 0.0], alpha=0.3)
+        single_late     = _damped_aggregate([0.0, 0.0, 0.0, 1.0], alpha=0.3)
+        assert sustained_early > single_late
+
+    def test_global_alpha_0_5_balances_recency_and_history(self):
+        # With ALPHA=0.5 (current default), sustained early and single late spike
+        # are equally weighted — recency and history have equal influence.
+        assert ALPHA == 0.5, "Update this test if ALPHA constant changes"
         sustained_early = _damped_aggregate([1.0, 1.0, 1.0, 0.0])
         single_late     = _damped_aggregate([0.0, 0.0, 0.0, 1.0])
-        assert sustained_early > single_late
+        assert sustained_early == pytest.approx(single_late, abs=1e-6)
 
     def test_all_same_values_returns_that_value(self):
         assert _damped_aggregate([0.5, 0.5, 0.5, 0.5]) == pytest.approx(0.5, abs=1e-6)

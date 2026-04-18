@@ -23,17 +23,15 @@ from shared.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_EVALUATIONS = 10   # cap lookback to avoid prompt bloat
+MAX_EVALUATIONS = 10   # cap same-commodity lookback
+MAX_CROSS = 3          # max cross-commodity evaluations prepended as soft prior
 MAX_INSIGHTS = 3       # max past insight bullets in prompt
 
 
-def _fetch_evaluations(commodity: str, anomaly_type: str) -> list[dict]:
-    """
-    Fetch up to MAX_EVALUATIONS most recent evaluations for this
-    commodity + anomaly_type pair, ordered oldest-first (for damping).
-    """
+def _fetch_eval_rows(commodity: str, anomaly_type: str, limit: int) -> list:
+    """Raw DB fetch for evaluation rows, newest-first."""
     with get_session() as session:
-        rows = session.execute(
+        return session.execute(
             text("""
                 SELECT
                     pe.prediction_accuracy_json,
@@ -48,21 +46,15 @@ def _fetch_evaluations(commodity: str, anomaly_type: str) -> list[dict]:
                 ORDER BY lu.created_at DESC
                 LIMIT :limit
             """),
-            {
-                "commodity": commodity,
-                "anomaly_type": anomaly_type,
-                "limit": MAX_EVALUATIONS,
-            },
+            {"commodity": commodity, "anomaly_type": anomaly_type, "limit": limit},
         ).fetchall()
 
-    # Reverse so oldest is first (required by damped_aggregate)
-    rows = list(reversed(rows))
 
+def _rows_to_evals(rows) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Parse raw DB rows into evaluation dicts and insight tuples."""
     evaluations: list[dict] = []
-    insights: list[tuple[str, str]] = []  # (insight, future_adjustment)
-
-    for row in rows:
-        accuracy_json, failure_json, insight, future_adj = row
+    insights: list[tuple[str, str]] = []
+    for accuracy_json, failure_json, insight, future_adj in rows:
         try:
             accuracy = json.loads(accuracy_json or "{}")
         except json.JSONDecodeError:
@@ -71,18 +63,46 @@ def _fetch_evaluations(commodity: str, anomaly_type: str) -> list[dict]:
             failure_modes = json.loads(failure_json or "[]")
         except json.JSONDecodeError:
             failure_modes = []
-
         evaluations.append({
             "direction_correct": accuracy.get("direction_correct"),
             "magnitude_error": float(accuracy.get("magnitude_error") or 0.0),
             "volatility_correct": accuracy.get("volatility_correct"),
             "failure_modes": failure_modes,
         })
-
         if insight:
             insights.append((insight, future_adj or ""))
-
     return evaluations, insights
+
+
+def _fetch_evaluations(commodity: str, anomaly_type: str) -> tuple[list[dict], list[tuple[str, str]]]:
+    """
+    Fetch evaluations for this commodity+anomaly_type pair, then prepend a
+    small cross-commodity sample (same anomaly_type, other commodities) as a
+    soft prior — weighted lower by position in the damped aggregate.
+
+    The cross-commodity rows are prepended (treated as older data) so the
+    same-commodity rows remain the most recent and thus most influential.
+    """
+    from shared.commodity_registry import COMMODITY_LIST
+
+    # Same-commodity rows (newest-first), then reversed to oldest-first
+    same_rows = list(reversed(_fetch_eval_rows(commodity, anomaly_type, MAX_EVALUATIONS)))
+
+    # Cross-commodity rows — one fetch per other commodity, oldest-first merged
+    cross_rows = []
+    for other in COMMODITY_LIST:
+        if other == commodity:
+            continue
+        cross_rows.extend(_fetch_eval_rows(other, anomaly_type, MAX_CROSS))
+    cross_rows = cross_rows[:MAX_CROSS]  # cap total cross-commodity contribution
+
+    # Prepend cross rows so they appear "older" (more damped) than same-commodity rows
+    all_rows = cross_rows + same_rows
+
+    evals, insights = _rows_to_evals(all_rows)
+    # Only surface insights from same-commodity rows for the prompt
+    _, same_insights = _rows_to_evals(same_rows)
+    return evals, same_insights
 
 
 def get_learning_context(commodity: str, anomaly_type: str) -> str:

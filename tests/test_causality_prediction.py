@@ -278,7 +278,8 @@ class TestPredictionEngine:
         mock_gemini_class = MagicMock(return_value=mock_gemini_inst)
 
         with patch("ai_engine.prediction_engine.get_session", side_effect=fake_session), \
-             patch("ai_engine.prediction_engine.GeminiClient", mock_gemini_class):
+             patch("ai_engine.prediction_engine.GeminiClient", mock_gemini_class), \
+             patch("ai_engine.prediction_engine.calibrate_confidence", side_effect=lambda raw, _c: raw):
             from ai_engine.prediction_engine import run_prediction_engine
             return run_prediction_engine()
 

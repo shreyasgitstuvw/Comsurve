@@ -3,23 +3,41 @@ Pre-Event Scenario Prediction Engine — generates probabilistic price scenarios
 for new SignalAlerts before their monitoring windows close.
 
 For each SignalAlert that has no prediction_json yet:
-  1. Gather anomaly details + historical analogs + context payload from embeddings_cache
-  2. Build a structured Gemini prompt
-  3. If confidence_score >= 0.6: store full prediction; else store prediction_type='no_signal'
-  4. Update signal_alerts.prediction_json / prediction_type / prediction_confidence
+  1. Gather anomaly details + 7-day trajectory + 30-day market context + analogs + feedback
+  2. Build a structured Gemini prompt with chain-of-thought reasoning step
+  3. Apply confidence calibration (Platt scaling or shrinkage prior)
+  4. If calibrated_confidence >= 0.6: store full prediction; else store prediction_type='no_signal'
+  5. Update signal_alerts.prediction_json / prediction_type / prediction_confidence
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import text
 
+from ai_engine.confidence_calibrator import calibrate_confidence
 from ai_engine.gemini_client import GeminiClient
 from ai_engine.learning_store import get_learning_context
 from shared.db import get_session
 from shared.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Analogs with cosine similarity below this are annotated as weak in the prompt
+WEAK_ANALOG_THRESHOLD = 0.70
+
+# Per-anomaly-type guidance on which time horizons are most predictable
+HORIZON_GUIDANCE: dict[str, str] = {
+    "ais_vessel_drop":       "AIS ship tracking best predicts 1–2 week outcomes (port logistics have a defined lag). Weight 1w and 2w outcomes higher; treat 1m as speculative.",
+    "ais_cluster":           "AIS cluster signals best predict 2-week outcomes. Weight 2w highest.",
+    "sentiment_shift":       "Sentiment shifts are typically mean-reverting. Weight 1w outcome highest; discount 2w and 1m.",
+    "price_spike":           "Price spike anomalies best predict 1–2 week reversions. 1m persistence depends on fundamental driver continuity.",
+    "price_historical":      "Historical price anomalies from FRED/EIA reflect structural shifts — weight 1m outcomes higher.",
+    "rail_corridor_gap":     "Rail logistics gaps resolve in 2–3 weeks. Weight 2w outcomes highest.",
+    "satellite_backscatter": "Satellite backscatter changes take 2–4 weeks to translate to prices. Weight 2w and 1m.",
+}
+_HORIZON_DEFAULT = "Weight all three time horizons equally unless signal characteristics suggest otherwise."
+
 
 PREDICTION_PROMPT = """You are a commodity market analyst specialising in supply chain disruption signals.
 
@@ -30,13 +48,20 @@ STRICT RULES:
 2. If confidence < 0.6, set prediction_type to "no_signal" and return empty predicted_outcomes []
 3. Prefer a magnitude-only prediction (direction_confidence: "low") over a low-confidence directional call
 4. List only specific, observable supply/demand/geopolitical drivers — avoid generic placeholders
+5. "invalidating_conditions" must be concrete, observable events that would falsify this prediction
 
 COMMODITY: {commodity}
-ANOMALY TYPE: {anomaly_type} (severity: {severity:.2f})
+ANOMALY TYPE: {anomaly_type}
 DETECTED: {detected_at}
 
 SIGNAL CONTEXT:
 {signal_context}
+
+ANOMALY TRAJECTORY (7-day pre-event trend):
+{anomaly_trajectory}
+
+RECENT MARKET CONTEXT (30-day price trend):
+{market_context}
 
 HISTORICAL ANALOGS (similar past events):
 {analogs_section}
@@ -46,7 +71,13 @@ FEEDBACK FROM PAST PREDICTIONS (damped learning signal):
 
 CURRENT PRICE: {current_price}
 
-Return ONLY valid JSON matching this schema exactly:
+HORIZON-SPECIFIC GUIDANCE:
+{horizon_guidance}
+
+STEP 1 — BRIEF REASONING (write 2-3 sentences, then give your JSON):
+Consider: (a) How strong are the supply-side signals vs. demand-side? (b) Do the historical analogs support a directional call or only magnitude uncertainty? (c) What is the dominant source of uncertainty?
+
+STEP 2 — OUTPUT (valid JSON only, immediately after your reasoning):
 {{
   "event_id": "{event_id}",
   "commodity": "{commodity}",
@@ -63,46 +94,17 @@ Return ONLY valid JSON matching this schema exactly:
   "confidence_score": <float 0.0-1.0>,
   "prediction_type": "<directional|magnitude_only|no_signal>",
   "drivers": ["<specific driver 1>", "<specific driver 2>"],
-  "historical_analogs": [<list of analog anomaly_event IDs as integers>]
+  "historical_analogs": [<list of analog anomaly_event IDs as integers>],
+  "invalidating_conditions": ["<observable condition that would falsify this prediction>"]
 }}"""
 
 
-def _build_analogs_section(correlated_ids: list[int], similarity_scores: list[float]) -> str:
-    """Fetch details of correlated historical anomalies to include in prompt."""
-    if not correlated_ids:
-        return "No similar historical events found (novel event)."
-
-    lines = []
-    with get_session() as session:
-        for aid, score in zip(correlated_ids[:5], similarity_scores[:5]):
-            row = session.execute(
-                text("""
-                    SELECT commodity, anomaly_type, severity, detected_at, metadata_json
-                    FROM anomaly_events WHERE id = :id
-                """),
-                {"id": aid},
-            ).fetchone()
-            if not row:
-                continue
-            try:
-                meta = json.loads(row[4] or "{}")
-                pct = meta.get("pct_change", "N/A")
-                if isinstance(pct, float):
-                    pct = f"{pct * 100:+.2f}%"
-            except (json.JSONDecodeError, KeyError):
-                pct = "N/A"
-            lines.append(
-                f"  Event {aid} (similarity {score:.3f}): {row[1]} on {row[0].upper()} "
-                f"at {str(row[3])[:10]}, severity={row[2]:.2f}, price_change={pct}"
-            )
-    return "\n".join(lines) if lines else "Historical analog data unavailable."
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Context builders
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_signal_context(anomaly_event_id: int) -> str:
-    """
-    Retrieve the context_payload stored by the embedding generator for this anomaly.
-    Falls back to a minimal description if not available.
-    """
+    """Retrieve context_payload from embeddings_cache (up to 6000 chars)."""
     with get_session() as session:
         row = session.execute(
             text("""
@@ -119,9 +121,8 @@ def _get_signal_context(anomaly_event_id: int) -> str:
 
     context_payload, anomaly_type, commodity, metadata_json = row
     if context_payload:
-        return context_payload[:2000]  # cap at 2000 chars
+        return context_payload[:6000]  # raised from 2000
 
-    # Fallback: build minimal context from metadata
     try:
         meta = json.loads(metadata_json or "{}")
     except json.JSONDecodeError:
@@ -133,12 +134,147 @@ def _get_signal_context(anomaly_event_id: int) -> str:
     return "\n".join(parts)
 
 
+def _get_anomaly_trajectory(commodity: str, detected_at) -> str:
+    """
+    Fetch 7-day pre-event trend (price, z_score, sentiment) so the model can
+    distinguish a spike-on-uptrend from a mean-reversion spike.
+    """
+    if isinstance(detected_at, str):
+        try:
+            detected_at = datetime.fromisoformat(detected_at)
+        except ValueError:
+            return "Trajectory data unavailable."
+
+    window_start = detected_at - timedelta(days=7)
+
+    with get_session() as session:
+        rows = session.execute(
+            text("""
+                SELECT ri.timestamp, pf.feature_type, pf.value
+                FROM processed_features pf
+                JOIN raw_ingestion ri ON pf.raw_ingestion_id = ri.id
+                WHERE ri.commodity = :commodity
+                  AND ri.timestamp BETWEEN :start AND :end
+                  AND pf.feature_type IN ('price', 'z_score', 'sentiment')
+                ORDER BY ri.timestamp ASC
+            """),
+            {"commodity": commodity, "start": window_start, "end": detected_at},
+        ).fetchall()
+
+    if not rows:
+        return "No pre-event data available within 7 days."
+
+    by_type: dict[str, list] = {}
+    for ts, ftype, val in rows:
+        try:
+            by_type.setdefault(ftype, []).append((str(ts)[:10], round(float(val), 4)))
+        except (TypeError, ValueError):
+            continue
+
+    lines = ["7-day pre-event trend (oldest → newest):"]
+    for ftype, points in by_type.items():
+        sampled = points[::max(1, len(points) // 7)][-7:]
+        pts_str = ", ".join(f"{d}: {v}" for d, v in sampled)
+        lines.append(f"  {ftype}: {pts_str}")
+    return "\n".join(lines)
+
+
+def _get_market_context(commodity: str, detected_at) -> str:
+    """Fetch 30-day price trend to give macro price momentum context."""
+    if isinstance(detected_at, str):
+        try:
+            detected_at = datetime.fromisoformat(detected_at)
+        except ValueError:
+            return "Market context unavailable."
+
+    window_start = detected_at - timedelta(days=30)
+
+    with get_session() as session:
+        rows = session.execute(
+            text("""
+                SELECT ri.timestamp, pf.value
+                FROM processed_features pf
+                JOIN raw_ingestion ri ON pf.raw_ingestion_id = ri.id
+                WHERE ri.commodity = :commodity
+                  AND ri.timestamp BETWEEN :start AND :end
+                  AND pf.feature_type = 'price'
+                ORDER BY ri.timestamp ASC
+            """),
+            {"commodity": commodity, "start": window_start, "end": detected_at},
+        ).fetchall()
+
+    if not rows:
+        return "No 30-day price data available."
+
+    prices = []
+    for ts, val in rows:
+        try:
+            prices.append((str(ts)[:10], round(float(val), 4)))
+        except (TypeError, ValueError):
+            continue
+
+    if len(prices) < 2:
+        return f"Insufficient price history. Latest: {prices[0][1] if prices else 'N/A'}"
+
+    first, last = prices[0][1], prices[-1][1]
+    pct = (last - first) / first * 100 if first else 0.0
+    trend = "upward" if pct > 2 else ("downward" if pct < -2 else "sideways")
+
+    step = max(1, len(prices) // 8)
+    sampled = prices[::step]
+    pts_str = ", ".join(f"{d}: {v}" for d, v in sampled)
+    return (
+        f"30-day trend: {trend} ({pct:+.1f}% from {first} to {last})\n"
+        f"  Sampled prices: {pts_str}"
+    )
+
+
+def _build_analogs_section(correlated_ids: list[int], similarity_scores: list[float]) -> str:
+    """
+    Fetch details of correlated historical anomalies (up to 8).
+    Analogs with similarity < WEAK_ANALOG_THRESHOLD are annotated as weak.
+    Cross-commodity analogs are naturally labelled by their commodity field.
+    """
+    if not correlated_ids:
+        return "No similar historical events found (novel event)."
+
+    lines = []
+    with get_session() as session:
+        for aid, score in zip(correlated_ids[:8], similarity_scores[:8]):
+            row = session.execute(
+                text("""
+                    SELECT commodity, anomaly_type, severity, detected_at, metadata_json
+                    FROM anomaly_events WHERE id = :id
+                """),
+                {"id": aid},
+            ).fetchone()
+            if not row:
+                continue
+            try:
+                meta = json.loads(row[4] or "{}")
+                pct = meta.get("pct_change", "N/A")
+                if isinstance(pct, float):
+                    pct = f"{pct * 100:+.2f}%"
+            except (json.JSONDecodeError, KeyError):
+                pct = "N/A"
+            annotation = " (weak analog)" if score < WEAK_ANALOG_THRESHOLD else ""
+            lines.append(
+                f"  Event {aid}{annotation} (similarity {score:.3f}): {row[1]} on "
+                f"{row[0].upper()} at {str(row[3])[:10]}, "
+                f"severity={row[2]:.2f}, price_change={pct}"
+            )
+    return "\n".join(lines) if lines else "Historical analog data unavailable."
+
+
 def _compute_prediction_type(prediction_dict: dict) -> str:
-    """Extract prediction_type from Gemini response, defaulting safely."""
     ptype = prediction_dict.get("prediction_type", "no_signal")
     valid = {"directional", "magnitude_only", "no_signal"}
     return ptype if ptype in valid else "no_signal"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main engine
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_prediction_engine() -> dict:
     """
@@ -150,7 +286,6 @@ def run_prediction_engine() -> dict:
     no_signal = 0
     failed = 0
 
-    # Fetch all signal_alerts without a prediction yet
     with get_session() as session:
         rows = session.execute(
             text("""
@@ -181,11 +316,14 @@ def run_prediction_engine() -> dict:
             corr_ids, scores = [], []
 
         signal_context = _get_signal_context(anomaly_event_id)
+        anomaly_trajectory = _get_anomaly_trajectory(commodity, detected_at)
+        market_context = _get_market_context(commodity, detected_at)
         analogs_section = _build_analogs_section(corr_ids, scores)
         current_price = str(price_at_alert) if price_at_alert is not None else "N/A"
         learning_section = get_learning_context(commodity, anomaly_type)
         if not learning_section:
             learning_section = "No prior evaluations available for this signal type."
+        horizon_guidance = HORIZON_GUIDANCE.get(anomaly_type, _HORIZON_DEFAULT)
 
         prompt = PREDICTION_PROMPT.format(
             commodity=commodity,
@@ -193,29 +331,39 @@ def run_prediction_engine() -> dict:
             severity=float(severity),
             detected_at=str(detected_at),
             signal_context=signal_context,
+            anomaly_trajectory=anomaly_trajectory,
+            market_context=market_context,
             analogs_section=analogs_section,
             learning_section=learning_section,
             current_price=current_price,
+            horizon_guidance=horizon_guidance,
             event_id=str(anomaly_event_id),
         )
 
         try:
             raw_response = client.generate_text(prompt)
+
+            # Strip chain-of-thought reasoning text before the JSON block
+            json_start = raw_response.find("{")
+            if json_start > 0:
+                raw_response = raw_response[json_start:]
+
             pred_dict = json.loads(raw_response)
 
-            confidence = float(pred_dict.get("confidence_score", 0.0))
+            raw_confidence = float(pred_dict.get("confidence_score", 0.0))
+            calibrated_confidence = calibrate_confidence(raw_confidence, commodity)
             prediction_type = _compute_prediction_type(pred_dict)
 
-            # Enforce no_signal rule if confidence below threshold
-            if confidence < 0.6:
+            if calibrated_confidence < 0.6:
                 prediction_type = "no_signal"
                 pred_dict["prediction_type"] = "no_signal"
                 pred_dict["predicted_outcomes"] = []
 
+            pred_dict["confidence_score"] = calibrated_confidence
             pred_dict.setdefault("event_id", str(anomaly_event_id))
             pred_dict.setdefault("commodity", commodity)
+            pred_dict.setdefault("invalidating_conditions", [])
 
-            # Persist to signal_alerts
             with get_session() as session:
                 session.execute(
                     text("""
@@ -228,7 +376,7 @@ def run_prediction_engine() -> dict:
                     {
                         "pjson": json.dumps(pred_dict),
                         "ptype": prediction_type,
-                        "pconf": confidence,
+                        "pconf": calibrated_confidence,
                         "id": alert_id,
                     },
                 )
@@ -239,7 +387,8 @@ def run_prediction_engine() -> dict:
                     "prediction_no_signal",
                     alert_id=alert_id,
                     commodity=commodity,
-                    confidence=confidence,
+                    raw_confidence=raw_confidence,
+                    calibrated_confidence=calibrated_confidence,
                 )
             else:
                 predictions_generated += 1
@@ -248,7 +397,8 @@ def run_prediction_engine() -> dict:
                     alert_id=alert_id,
                     commodity=commodity,
                     prediction_type=prediction_type,
-                    confidence=confidence,
+                    raw_confidence=raw_confidence,
+                    calibrated_confidence=calibrated_confidence,
                 )
 
         except Exception as exc:

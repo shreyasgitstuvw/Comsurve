@@ -16,13 +16,16 @@ from datetime import datetime
 from sqlalchemy import text
 
 from ai_engine.qdrant_manager import QdrantManager
+from shared.commodity_registry import COMMODITY_LIST
 from shared.db import get_session
 from shared.logger import get_logger
 from shared.models import AnomalyEvent, EmbeddingCache, SignalAlert, unpack_vector
 
 logger = get_logger(__name__)
 
-MIN_SIMILARITY = 0.70   # cosine threshold — below this, treat as novel
+MIN_SIMILARITY = 0.55         # cosine floor — below this, treat as novel
+CROSS_COMMODITY_SIMILARITY = 0.75  # higher bar for cross-commodity analogs
+TOP_K = 8                 # max same-commodity analogs (was 5)
 
 
 def _get_current_price(commodity: str) -> float | None:
@@ -106,18 +109,35 @@ def run_signal_correlation() -> dict:
                 skipped += 1
                 continue
 
-            # Qdrant nearest-neighbor search (exclude self)
+            # Same-commodity nearest-neighbor search
             similar = qdrant.search_similar(
                 commodity=commodity,
                 vector=vector,
-                top_k=5,
+                top_k=TOP_K,
                 exclude_id=anomaly_id,
                 min_score=MIN_SIMILARITY,
             )
 
-            # Build correlated IDs and scores
             correlated_ids = [int(r.id) for r in similar]
             similarity_scores = [round(r.score, 4) for r in similar]
+
+            # Cross-commodity search — higher threshold, other commodity collections only
+            for other_commodity in COMMODITY_LIST:
+                if other_commodity == commodity:
+                    continue
+                cross_similar = qdrant.search_similar(
+                    commodity=other_commodity,
+                    vector=vector,
+                    top_k=3,
+                    exclude_id=None,
+                    min_score=CROSS_COMMODITY_SIMILARITY,
+                )
+                for r in cross_similar:
+                    aid = int(r.id)
+                    if aid not in correlated_ids:
+                        correlated_ids.append(aid)
+                        similarity_scores.append(round(r.score, 4))
+
             alert_type = "similar_historical" if correlated_ids else "novel_event"
 
             if alert_type == "novel_event":
